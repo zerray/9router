@@ -174,24 +174,64 @@ async function bingTts(text, voiceId) {
   return Buffer.from(buf).toString("base64"); // base64 MP3
 }
 
-// ── Local Device TTS (macOS `say` + ffmpeg) ───────────────────
+// ── Local Device TTS (macOS `say` + Windows SAPI + ffmpeg) ──────
 let _localVoicesCache = null;
+
+async function fetchLocalDeviceVoicesMac() {
+  const { stdout } = await execFileAsync("say", ["-v", "?"]);
+  const voices = [];
+  for (const line of stdout.split("\n")) {
+    // Format: "Name   locale   # sample"
+    const m = line.match(/^([^\s].*?)\s{2,}([a-z]{2}_[A-Z]{2})/);
+    if (!m) continue;
+    const name    = m[1].trim();
+    const locale  = m[2].trim(); // e.g. en_US
+    const lang    = locale.split("_")[0];
+    const country = locale.split("_")[1];
+    voices.push({ id: name, name, locale, lang, country, gender: "" });
+  }
+  return voices;
+}
+
+async function fetchLocalDeviceVoicesWin() {
+  // Use -WindowStyle Hidden to suppress PowerShell popup window
+  const script = [
+    "Add-Type -AssemblyName System.Speech;",
+    "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;",
+    "$s.GetInstalledVoices() | ForEach-Object { $v = $_.VoiceInfo;",
+    "[PSCustomObject]@{ Name=$v.Name; Culture=$v.Culture.Name; Gender=$v.Gender } }",
+    "| ConvertTo-Json -Compress",
+  ].join(" ");
+  const { stdout } = await execFileAsync(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script],
+    { windowsHide: true }
+  );
+  const raw = JSON.parse(stdout.trim() || "[]");
+  // Normalize: single object → array
+  const list = Array.isArray(raw) ? raw : [raw];
+  return list.map((v) => {
+    const culture = v.Culture || "en-US";
+    const [lang, country = ""] = culture.split("-");
+    // Gender: 0=NotSet, 1=Male, 2=Female (SAPI enum)
+    const genderMap = { 1: "Male", 2: "Female", Male: "Male", Female: "Female" };
+    return {
+      id:      v.Name,
+      name:    v.Name,
+      locale:  culture.replace("-", "_"),
+      lang,
+      country,
+      gender:  genderMap[v.Gender] || "",
+    };
+  });
+}
 
 export async function fetchLocalDeviceVoices() {
   if (_localVoicesCache) return _localVoicesCache;
   try {
-    const { stdout } = await execFileAsync("say", ["-v", "?"]);
-    const voices = [];
-    for (const line of stdout.split("\n")) {
-      // Format: "Name   locale   # sample"
-      const m = line.match(/^([^\s].*?)\s{2,}([a-z]{2}_[A-Z]{2})/);
-      if (!m) continue;
-      const name   = m[1].trim();
-      const locale = m[2].trim(); // e.g. en_US
-      const lang   = locale.split("_")[0];
-      const country = locale.split("_")[1];
-      voices.push({ id: name, name, locale, lang, country, gender: "" });
-    }
+    const voices = process.platform === "win32"
+      ? await fetchLocalDeviceVoicesWin()
+      : await fetchLocalDeviceVoicesMac();
     _localVoicesCache = voices;
     return voices;
   } catch {
@@ -299,6 +339,84 @@ export const VOICE_FETCHERS = {
   // openai: uses hardcoded voices from providerModels.js
 };
 
+// ── OpenRouter TTS (via chat completions + audio modality) ───────────────────
+async function handleOpenRouterTts({ model, input, credentials, responseFormat = "mp3" }) {
+  if (!credentials?.apiKey) {
+    return createErrorResult(HTTP_STATUS.UNAUTHORIZED, "No OpenRouter API key configured");
+  }
+
+  // model format: "tts-model/voice" e.g. "openai/gpt-4o-mini-tts/alloy"
+  let ttsModel = "openai/gpt-4o-mini-tts";
+  let voice = "alloy";
+  if (model && model.includes("/")) {
+    const lastSlash = model.lastIndexOf("/");
+    const maybVoice = model.slice(lastSlash + 1);
+    const maybeModel = model.slice(0, lastSlash);
+    // voice names are simple lowercase words, model names contain "/"
+    if (maybeModel.includes("/")) {
+      ttsModel = maybeModel;
+      voice = maybVoice;
+    } else {
+      voice = model;
+    }
+  } else if (model) {
+    voice = model;
+  }
+
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${credentials.apiKey}`,
+      "HTTP-Referer": "https://endpoint-proxy.local",
+      "X-Title": "Endpoint Proxy",
+    },
+    body: JSON.stringify({
+      model: ttsModel,
+      modalities: ["text", "audio"],
+      audio: { voice, format: "wav" },
+      stream: true,
+      messages: [{ role: "user", content: input }],
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    return createErrorResult(res.status, err?.error?.message || `OpenRouter TTS failed: ${res.status}`);
+  }
+
+  // Parse SSE stream, accumulate base64 audio chunks
+  const chunks = [];
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+      try {
+        const json = JSON.parse(line.slice(6));
+        const audioData = json.choices?.[0]?.delta?.audio?.data;
+        if (audioData) chunks.push(audioData);
+      } catch {}
+    }
+  }
+
+  if (chunks.length === 0) {
+    return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "OpenRouter TTS returned no audio data");
+  }
+
+  const base64Audio = chunks.join("");
+  return createTtsResponse(base64Audio, "wav", responseFormat);
+}
+
 // ── OpenAI TTS ───────────────────────────────────────────────────────────────
 async function handleOpenAiTts({ model, input, credentials, responseFormat = "mp3" }) {
   if (!credentials?.apiKey) {
@@ -379,6 +497,12 @@ const TTS_PROVIDERS = {
   "openai": {
     synthesize: async (text, model, credentials, responseFormat) => {
       return await handleOpenAiTts({ model, input: text, credentials, responseFormat });
+    },
+    requiresCredentials: true,
+  },
+  "openrouter": {
+    synthesize: async (text, model, credentials, responseFormat) => {
+      return await handleOpenRouterTts({ model, input: text, credentials, responseFormat });
     },
     requiresCredentials: true,
   },

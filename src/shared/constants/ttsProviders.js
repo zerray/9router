@@ -4,18 +4,28 @@
  */
 export const TTS_PROVIDER_CONFIG = {
   "google-tts": {
-    hasLanguageDropdown: true,
+    hasLanguageDropdown: false,
     hasModelSelector: false,
-    hasBrowseButton: false,
-    voiceSource: "hardcoded", // from providerModels
+    hasBrowseButton: true,
+    voiceSource: "hardcoded", // languages built from providerModels at runtime
   },
   "openai": {
     hasLanguageDropdown: false,
     hasModelSelector: true,
     hasBrowseButton: false,
-    voiceSource: "hardcoded", // from providerModels
+    voiceSource: "hardcoded",
     modelKey: "openai-tts-models",
     voiceKey: "openai-tts-voices",
+    voicesPerModel: true,
+  },
+  "openrouter": {
+    hasLanguageDropdown: false,
+    hasModelSelector: true,
+    hasBrowseButton: false,
+    voiceSource: "hardcoded",
+    modelKey: "openrouter-tts-models",
+    voiceKey: "openrouter-tts-voices",
+    voicesPerModel: true,
   },
   "elevenlabs": {
     hasLanguageDropdown: false,
