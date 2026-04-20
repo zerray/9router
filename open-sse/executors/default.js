@@ -9,6 +9,25 @@ export class DefaultExecutor extends BaseExecutor {
     super(provider, PROVIDERS[provider] || PROVIDERS.openai);
   }
 
+  // jbt.model123.dev rejects `thinking.type:"enabled"` and requires
+  // `thinking.type:"adaptive"` + `output_config.effort`.
+  transformRequest(model, body, stream, credentials) {
+    if (!this.provider?.startsWith?.("anthropic-compatible-")) return body;
+    const baseUrl = credentials?.providerSpecificData?.baseUrl || "";
+    const hitJbt = baseUrl.includes("jbt.model123.dev");
+    if (!hitJbt) return body;
+    if (body?.thinking?.type !== "enabled") return body;
+
+    const budget = Number(body.thinking.budget_tokens) || 0;
+    const effort = budget <= 2000 ? "low" : budget > 8000 ? "high" : "medium";
+    const { budget_tokens, ...restThinking } = body.thinking;
+    return {
+      ...body,
+      thinking: { ...restThinking, type: "adaptive" },
+      output_config: { ...(body.output_config || {}), effort }
+    };
+  }
+
   buildUrl(model, stream, urlIndex = 0, credentials = null) {
     if (this.provider?.startsWith?.("openai-compatible-")) {
       const baseUrl = credentials?.providerSpecificData?.baseUrl || "https://api.openai.com/v1";
