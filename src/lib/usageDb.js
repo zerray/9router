@@ -141,22 +141,37 @@ export function trackPendingRequest(model, provider, connectionId, started, erro
   }
 
   if (started) {
-    // Safety timeout: force-clear if END is never called (client disconnect, crash, etc.)
-    clearTimeout(pendingTimers[timerKey]);
-    pendingTimers[timerKey] = setTimeout(() => {
-      delete pendingTimers[timerKey];
+    // Safety timeout: force-clear one pending slot if END is never called
+    // (client disconnect, crash, etc.). Keep one timer per concurrent request;
+    // a single aggregate timer key would let same account/model requests
+    // overwrite each other.
+    if (!Array.isArray(pendingTimers[timerKey])) {
+      if (pendingTimers[timerKey]) clearTimeout(pendingTimers[timerKey]);
+      pendingTimers[timerKey] = [];
+    }
+    const timer = setTimeout(() => {
+      pendingTimers[timerKey] = (pendingTimers[timerKey] || []).filter(t => t !== timer);
+      if (pendingTimers[timerKey]?.length === 0) delete pendingTimers[timerKey];
       if (pendingRequests.byModel[modelKey] > 0) {
-        pendingRequests.byModel[modelKey] = 0;
+        pendingRequests.byModel[modelKey] -= 1;
       }
       if (connectionId && pendingRequests.byAccount[connectionId]?.[modelKey] > 0) {
-        pendingRequests.byAccount[connectionId][modelKey] = 0;
+        pendingRequests.byAccount[connectionId][modelKey] -= 1;
       }
       statsEmitter.emit("pending");
     }, PENDING_TIMEOUT_MS);
+    pendingTimers[timerKey].push(timer);
   } else {
-    // END called normally — cancel the safety timer
-    clearTimeout(pendingTimers[timerKey]);
-    delete pendingTimers[timerKey];
+    // END called normally — cancel one safety timer for this aggregate key.
+    if (pendingTimers[timerKey] && !Array.isArray(pendingTimers[timerKey])) {
+      clearTimeout(pendingTimers[timerKey]);
+      delete pendingTimers[timerKey];
+    }
+    const timers = Array.isArray(pendingTimers[timerKey]) ? pendingTimers[timerKey] : [];
+    const timer = timers.shift();
+    if (timer) clearTimeout(timer);
+    if (timers.length > 0) pendingTimers[timerKey] = timers;
+    else delete pendingTimers[timerKey];
   }
 
   // Track error provider (auto-clears after 10s)

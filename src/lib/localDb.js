@@ -27,11 +27,11 @@ const DEFAULT_SETTINGS = {
   comboStrategies: {},
   requireLogin: true,
   tunnelDashboardAccess: true,
-  observabilityEnabled: true,
+  enableObservability: false,
   observabilityMaxRecords: 1000,
   observabilityBatchSize: 20,
   observabilityFlushIntervalMs: 5000,
-  observabilityMaxJsonSize: 1024,
+  observabilityMaxJsonSize: 5,
   outboundProxyEnabled: false,
   outboundProxyUrl: "",
   outboundNoProxy: "",
@@ -77,6 +77,15 @@ function ensureDbShape(data) {
     }
 
     if (key === "settings" && typeof next.settings === "object" && !Array.isArray(next.settings)) {
+      if (next.settings.observabilityEnabled !== undefined) {
+        delete next.settings.observabilityEnabled;
+        changed = true;
+      }
+      if (next.settings.observabilityMaxJsonSize === 1024) {
+        next.settings.observabilityMaxJsonSize = defaultValue.observabilityMaxJsonSize;
+        changed = true;
+      }
+
       for (const [settingKey, settingDefault] of Object.entries(defaultValue)) {
         if (next.settings[settingKey] === undefined) {
           // Backward-compat: if proxy URL was saved, default outboundProxyEnabled to true

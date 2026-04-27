@@ -12,6 +12,7 @@ const DEFAULT_FLUSH_INTERVAL_MS = 5000;
 const DEFAULT_MAX_JSON_SIZE = 5 * 1024; // 5KB default, configurable via settings
 const CONFIG_CACHE_TTL_MS = 5000;
 const MAX_TOTAL_DB_SIZE = 50 * 1024 * 1024; // 50MB hard limit for total DB file
+const PREVIEW_LENGTH = 200;
 const DB_FILE = isCloud ? null : path.join(DATA_DIR, "request-details.json");
 
 if (!isCloud && !fs.existsSync(DATA_DIR)) {
@@ -44,10 +45,10 @@ async function getObservabilityConfig() {
   try {
     const { getSettings } = await import("@/lib/localDb");
     const settings = await getSettings();
-    const envEnabled = process.env.OBSERVABILITY_ENABLED !== "false";
+    const envEnabled = process.env.OBSERVABILITY_ENABLED === "true";
     const enabled = typeof settings.enableObservability === "boolean"
       ? settings.enableObservability
-      : envEnabled;
+      : (typeof settings.observabilityEnabled === "boolean" ? settings.observabilityEnabled : envEnabled);
 
     cachedConfig = {
       enabled,
@@ -79,12 +80,58 @@ function safeJsonStringify(obj, maxSize) {
   try {
     const str = JSON.stringify(obj);
     if (str.length > maxSize) {
-      return JSON.stringify({ _truncated: true, _originalSize: str.length, _preview: str.substring(0, 200) });
+      return JSON.stringify({ _truncated: true, _originalSize: str.length, _preview: str.substring(0, PREVIEW_LENGTH) });
     }
     return str;
   } catch {
     return "{}";
   }
+}
+
+function truncateJsonField(value, maxSize) {
+  if (value === null || value === undefined) return value;
+
+  let str;
+  try {
+    str = JSON.stringify(value);
+  } catch {
+    return {};
+  }
+
+  if (str.length <= maxSize) return value;
+
+  return {
+    _truncated: true,
+    _originalSize: str.length,
+    _preview: str.substring(0, PREVIEW_LENGTH),
+  };
+}
+
+function normalizeDetailForBuffer(detail, maxSize) {
+  detail ||= {};
+
+  const record = {
+    id: detail.id,
+    provider: detail.provider || null,
+    model: detail.model || null,
+    connectionId: detail.connectionId || null,
+    timestamp: detail.timestamp || new Date().toISOString(),
+    status: detail.status || null,
+    latency: detail.latency || {},
+    tokens: detail.tokens || {},
+    request: detail.request || {},
+    providerRequest: detail.providerRequest || {},
+    providerResponse: detail.providerResponse || {},
+    response: detail.response || {},
+  };
+
+  if (record.request?.headers) record.request.headers = sanitizeHeaders(record.request.headers);
+
+  for (const field of ["request", "providerRequest", "providerResponse", "response"]) {
+    record[field] = truncateJsonField(record[field], maxSize);
+  }
+
+  return record;
 }
 
 function sanitizeHeaders(headers) {
@@ -122,30 +169,7 @@ async function flushToDatabase() {
       if (!item.timestamp) item.timestamp = new Date().toISOString();
       if (item.request?.headers) item.request.headers = sanitizeHeaders(item.request.headers);
 
-      // Serialize large fields
-      const record = {
-        id: item.id,
-        provider: item.provider || null,
-        model: item.model || null,
-        connectionId: item.connectionId || null,
-        timestamp: item.timestamp,
-        status: item.status || null,
-        latency: item.latency || {},
-        tokens: item.tokens || {},
-        request: item.request || {},
-        providerRequest: item.providerRequest || {},
-        providerResponse: item.providerResponse || {},
-        response: item.response || {},
-      };
-
-      // Truncate oversized JSON fields
-      const maxSize = config.maxJsonSize;
-      for (const field of ["request", "providerRequest", "providerResponse", "response"]) {
-        const str = JSON.stringify(record[field]);
-        if (str.length > maxSize) {
-          record[field] = { _truncated: true, _originalSize: str.length, _preview: str.substring(0, 200) };
-        }
-      }
+      const record = normalizeDetailForBuffer(item, config.maxJsonSize);
 
       // Upsert: replace existing record with same id
       const idx = db.data.records.findIndex(r => r.id === record.id);
@@ -183,7 +207,7 @@ export async function saveRequestDetail(detail) {
   const config = await getObservabilityConfig();
   if (!config.enabled) return;
 
-  writeBuffer.push(detail);
+  writeBuffer.push(normalizeDetailForBuffer(detail, config.maxJsonSize));
 
   if (writeBuffer.length >= config.batchSize) {
     await flushToDatabase();
